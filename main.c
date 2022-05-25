@@ -8,14 +8,20 @@
 #include <sched.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#define ABS(x, y) ((x) > (y) ? (x) - (y) : (y) - (x))
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-void sgemm_kernel_x64_fma_m4n24(float *a,
+void sgemm_kernel_x64_fma_m8n12(float *a,
     float *b,
     float *c,
+    int m,
+    int k);
+
+void pack_(float *dst,
+    float *src,
     int m,
     int k);
 
@@ -57,13 +63,6 @@ static void page_free(void *mem, size_t size)
     munmap(mem, size);
 }
 
-void save_bin(const char *file_name, float *rst, int num)
-{
-    FILE *fp = fopen(file_name, "wb");
-    fwrite(rst, num, sizeof(float), fp);
-    fclose(fp);
-}
-
 void sgemm_naive(float *a, float *b, float *c, int m, int n, int k)
 {
     int i, j, kk;
@@ -90,9 +89,14 @@ int main(int argc, char *argv[])
     }
 
     int m = atoi(argv[1]);
+    if (m % 8 != 0) {
+        printf("m must be a multiple of 8.");
+        return -1;
+    }
     int k = atoi(argv[2]);
-    long comp = 2L * m * k * 24L;
+    long comp = 2L * m * k * 12L;
     int loop_time = (int)(2e11 / comp);
+    printf("sgemm_kernel loop_time : %d, m=%d n=%d k=%d\n", loop_time, m, 12, k);
 
     struct timespec start, end;
     double t, gflops;
@@ -100,9 +104,10 @@ int main(int argc, char *argv[])
     thread_bind(0);
 
     float *a = (float*)page_alloc(m * k * sizeof(float));
-    float *b = (float*)page_alloc(k * 24 * sizeof(float));
-    float *c1 = (float*)page_alloc(m * 24 * sizeof(float));
-    float *c2 = (float*)page_alloc(m * 24 * sizeof(float));
+    float *a_pack = (float*)page_alloc(m * k * sizeof(float));
+    float *b = (float*)page_alloc(k * 12 * sizeof(float));
+    float *c1 = (float*)page_alloc(m * 12 * sizeof(float));
+    float *c2 = (float*)page_alloc(m * 12 * sizeof(float));
 
     srand(time(NULL));
 
@@ -110,45 +115,59 @@ int main(int argc, char *argv[])
     {
         a[i] = (float)rand() / (float)RAND_MAX;
     }
-    for (i = 0; i < k * 24; i++)
+    for (i = 0; i < k * 12; i++)
     {
         b[i] = (float)rand() / (float)RAND_MAX;
     }
 
+    pack_(a_pack, a, m, k);
     // fma-tuned version
     // warm up
     for (i = 0; i < loop_time; i++)
     {
-        sgemm_kernel_x64_fma_m4n24(a, b, c2, m, k);
+        sgemm_kernel_x64_fma_m8n12(a_pack, b, c2, m, k);
     }
     clock_gettime(CLOCK_MONOTONIC_RAW, &start);
     for (i = 0; i < loop_time; i++)
     {
-        sgemm_kernel_x64_fma_m4n24(a, b, c2, m, k);
+        sgemm_kernel_x64_fma_m8n12(a_pack, b, c2, m, k);
     }
     clock_gettime(CLOCK_MONOTONIC_RAW, &end);
 
     t = get_time(&start, &end) / loop_time;
     gflops = (double)comp / t * 1e-9;
 
-    printf("sgemm_kernel_x64_fma(%d, %d, %d): time = %lf us, perf = %lf GFLOPS.\n", m, 24, k, t * 1e6, gflops);
+    printf("sgemm_kernel_x64_fma(%d, %d, %d): time = %lf us, perf = %lf GFLOPS.\n", m, 12, k, t * 1e6, gflops);
 
-    memset(c1, 0, m * 24 * sizeof(float));
-    memset(c2, 0, m * 24 * sizeof(float));
-    sgemm_naive(a, b, c1, m, 24, k);
-    sgemm_kernel_x64_fma_m4n24(a, b, c2, m, k);
-    save_bin("naive.bin", c1, m * 24);
-    save_bin("tuned.bin", c2, m * 24);
+    memset(c1, 0, m * 12 * sizeof(float));
+    memset(c2, 0, m * 12 * sizeof(float));
+    sgemm_naive(a, b, c1, m, 12, k);
+    sgemm_kernel_x64_fma_m8n12(a_pack, b, c2, m, k);
 
-    printf("sgemm_naive result: naive.bin\n");
-    printf("sgemm_kernel_x64_fma_m4n24 result: tuned.bin\n");
-    printf("Use fp_diff(https://github.com/pigirons/fp_diff) to compare the results.\n");
+    int check_pack = 1;
+    double v = 0;
+    int ind = 0;
+    for (int i = 0; i < m * 12; i++) {
+        v = ABS(c1[i], c2[i]);
+        if (v > 1e-4) {
+            ind = i;
+            check_pack = 0;
+            break;
+        }
+    }
+
+    if (check_pack != 1) {
+        printf("Check fail. at(%d) v=%lf\n", ind, v);
+    } else {
+        printf("Check pass.\n");
+    }
 
     page_free(a, m * k * sizeof(float));
-    page_free(b, k * 24 * sizeof(float));
-    page_free(c1, m * 24 * sizeof(float));
-    page_free(c2, m * 24 * sizeof(float));
-    
+    page_free(a_pack, m * k * sizeof(float));
+    page_free(b, k * 12 * sizeof(float));
+    page_free(c1, m * 12 * sizeof(float));
+    page_free(c2, m * 12 * sizeof(float));
+
     return 0;
 }
 
