@@ -1,1 +1,1 @@
-rm *.o sgemm_l1d
+rm -f sgemm_l1d
